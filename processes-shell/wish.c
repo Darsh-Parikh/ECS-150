@@ -7,7 +7,7 @@
 #include <sys/stat.h>
 #include <string.h>
 
-/*****************************************************************************/
+/************************** DYNAMIC ARRAY UTILITY ****************************/
 
 #define START_SIZE 128
 
@@ -26,7 +26,7 @@ DynamicArray initArray() {
 }
 
 void arrayInsert(DynamicArray* v, char* val) {
-    if (!v || !val) {
+    if (!v) {
         return;
     }
 
@@ -51,10 +51,10 @@ char* get(DynamicArray* v, int index) {
 }
 
 int getSize(DynamicArray* v) {
-    if (!v) {
-        return -1;
+    if (v) {
+        return v->size;
     }
-    return v->size;
+    return -1;
 }
 
 int findVal(DynamicArray* v, char* val) {
@@ -62,7 +62,8 @@ int findVal(DynamicArray* v, char* val) {
         return -1;
     }
 
-    for (int i = 0; i < v->size; i++) {
+    int n = v->size;
+    for (int i = 0; i < n; i++) {
         if (strcmp(val, v->data[i]) == 0) {
             return i;
         }
@@ -71,8 +72,14 @@ int findVal(DynamicArray* v, char* val) {
 }
 
 void freeArray(DynamicArray* v) {
-    free(v->data);
+    if (v) {
+        free(v->data);
+    }
 }
+
+/********************************* GLOBALS ***********************************/
+
+DynamicArray PATH;
 
 /*****************************************************************************/
 
@@ -81,33 +88,24 @@ void printError() {
     write(STDERR_FILENO, error_message, strlen(error_message)); 
 }
 
+/****************************** INPUT PARSERS ********************************/
+
 int isDelimiter(char c) {
     return (c == ' ') || (c == '\t') || (c == '>') || (c == '&');
 }
 
-char* concat(char* a, char* b) {
-    char* ans = (char*) malloc((strlen(a) + strlen(b) + 1) * sizeof(char));
-    strcpy(ans, a);
-    strcat(ans, b);
+char* strConcatenate(char* s1, char* s2) {
+    char* ans = (char*) malloc((strlen(s1) + strlen(s2) + 1) * sizeof(char));
+    strcpy(ans, s1);
+    strcat(ans, s2);
     return ans;
-}
-
-int hasToken(DynamicArray tokens, char *token) {
-    for (int i = 0; i < tokens.size; i++) {
-        if (   !strcmp(token, get(&tokens, i))
-            && (   (i == 0)
-                || (i != tokens.size-1 && !strcmp(token, get(&tokens, i+1))) )
-            ) {
-                return 0;
-            }
-    }
-    return 1;
 }
 
 DynamicArray parseCommands(char* line) {
     DynamicArray ans = initArray();
     int n = strlen(line);
     char* s = NULL;
+    
     int start = -1;
     for (int i = 0; i < n; i++) {
         if (line[i] == '>') {
@@ -129,7 +127,27 @@ DynamicArray parseCommands(char* line) {
     return ans;
 }
 
-/*****************************************************************************/
+int redirectCheck(DynamicArray tokens) {
+    int n = tokens.size;
+    for (int i = 0; i < n; i++) {
+        if ((strcmp(">", get(&tokens, i)) == 0) && ((i == 0 || i == n-1 || n-1-i > 1) || (i != n-1 && strcmp(">", get(&tokens, i+1)) == 0))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int parallelCheck(DynamicArray tokens) {
+    int n = tokens.size;
+    for (int i = 0; i < n; i++) {
+        if ((strcmp("&", get(&tokens, i)) == 0) && ((i == 0) || (i != n-1 && strcmp("&", get(&tokens, i+1)) == 0))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/***************************** PROCESS EXECUTION *****************************/
 
 int executeCommand(DynamicArray tokens) {
     char* command = get(&tokens, 0);
@@ -163,7 +181,7 @@ int executeCommand(DynamicArray tokens) {
         pos = tokens.size;
     }
     for (int i = 0; i < PATH.size; i++) {
-        char* p = concat(get(&PATH, i), concat("/", command));
+        char* p = strConcatenate(get(&PATH, i), strConcatenate("/", command));
         if (access(p, X_OK) == 0) {
             char* argv[pos+1];
             for (int i = 0; i < pos; i++) {
@@ -171,15 +189,15 @@ int executeCommand(DynamicArray tokens) {
             }
             argv[pos] = NULL;
             
-            int pid = fork();
-            if (pid == 0) {
+            int rc = fork();
+            if (rc == 0) {
                 if (pos != tokens.size) {
                     close(STDOUT_FILENO);
                     open(get(&tokens, tokens.size - 1), O_CREAT|O_WRONLY|O_TRUNC, S_IRWXU);
                 }
                 execv(p, argv);
             }
-            return pid;
+            return rc;
         }
     }
 
@@ -188,9 +206,8 @@ int executeCommand(DynamicArray tokens) {
 }
 
 /*****************************************************************************/
-
-
-DynamicArray PATH;
+/****************************         MAIN         ***************************/
+/*****************************************************************************/
 
 int main (int argc, char **argv) {
     FILE* source = stdin;
@@ -226,9 +243,9 @@ int main (int argc, char **argv) {
         DynamicArray tokens = parseCommands(line);
         DynamicArray command = initArray();
         int num_commands = 1, sz = 0;
-        int processIds[num_commands];
+        int pids[num_commands];
 
-        if (!hasToken(tokens, "&")) {
+        if (!parallelCheck(command)) {
             printError();
             continue;
         }
@@ -245,20 +262,20 @@ int main (int argc, char **argv) {
             }
             
             if ((i == tokens.size-1) || !strcmp("&", get(&tokens, i+1))) {
-                if (!hasToken(command, ">")) {
+                if (!redirectCheck(command)) {
                     printError();
                     break;
                 }
                 int res = executeCommand(command);
                 if (res != -1) {
-                    processIds[sz++] = res;
+                    pids[sz++] = res;
                 }
                 command = initArray();
             }
         }
 
         for (int i = 0; i < sz; i++) {
-            waitpid(processIds[i], NULL, 0);
+            waitpid(pids[i], NULL, 0);
         }
 
         free(line);
