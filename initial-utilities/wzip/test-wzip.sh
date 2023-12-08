@@ -6,5 +6,3 @@ if ! [[ -x wzip ]]; then
 fi
 
 ../../tester/run-tests.sh $*
-
-
