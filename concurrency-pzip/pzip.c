@@ -1,275 +1,273 @@
-#include "solution/thread_helper.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <fcntl.h>          // open, O_* constants
+#include <sys/sysinfo.h>    // get_nproc()
+#include <sys/mman.h>       // mmap, munmap
+#include <sys/stat.h>       // fstat
+#include <unistd.h>         // sysconf, close
 
 #include <pthread.h>
 #include <semaphore.h>
 
-#include <arpa/inet.h> // htonl
-#include <fcntl.h>     // open, O_* constants
-#include <stdio.h>     // fwrite, fprintf
-#include <stdlib.h>    // exit, malloc
-#include <sys/fcntl.h>
-#include <sys/mman.h> // mmap, munmap
-#include <sys/stat.h> // fstat, mode constants
-#include <sys/types.h>
-#include <unistd.h> // sysconf, close
-
 //-----------------------------------------------------------------------------
 
-void error_out(char *error_msg) {
-    perror(error_msg);
-    exit(EXIT_FAILURE);
+// #define __DEBUG
+
+void write_out(int count, char *character) {
+    fwrite(&count, 4, 1, stdout);
+    fwrite(character, 1, 1, stdout);
 }
 
 //-----------------------------------------------------------------------------
 
-// http://www.catb.org/esr/structure-packing/ & https://en.wikipedia.org/wiki/Data_structure_alignment
-typedef struct result {
-    struct result *next;
+typedef struct _work_list {
+    struct _work_list *next;
     int count;
     char character;
-    char pad[sizeof(struct result *) - sizeof(int) - sizeof(char)];
-} Result;
+} WorkList;
 
-static Result *create_result(int count, char character) {
-    Result *result = malloc(sizeof(Result));
-    if (!result) {
-        error_out("malloc");
+WorkList *work_list_block(int count, char character) {
+    WorkList *work_block = malloc(sizeof(WorkList));
+    if (!work_block) {
+        fprintf(stderr, "ERROR: Cannot create new work block\n");
+        exit(EXIT_FAILURE);
     }
-    result->count = count;
-    result->character = character;
-    result->next = NULL;
-    return result;
+    work_block->count = count;
+    work_block->character = character;
+    work_block->next = NULL;
+    return work_block;
 }
 
 //-----------------------------------------------------------------------------
 
-typedef struct work {
-    long long chunk_size;
+typedef struct _work {
+    size_t chunk_size;
     char *addr;
-    Result *results;
+    WorkList *work;
 } Work;
 
-typedef struct files {
+typedef struct _file {
     int fd;
-    char pad[sizeof(off_t) - sizeof(int)];
     off_t size;
-} Files;
-
-long long use_ptr = 0, fill_ptr = 0, chunks = 0;
-sem_t mutex, empty, full;
+} mFile_t;
 
 //-----------------------------------------------------------------------------
 
-static void *compress(void *arg) {
-  Work *works = (Work *)arg;
+size_t chunkInUse_idx = 0, chunkFilled_idx = 0, chunks = 0;
+sem_t mutex, worker_waiting, worker_loaded;
 
-  while (1) {
-    // use semaphore instead of mutex and condition variables
-    // because workers will wait for the mutex and
-    // pthread_mutex_lock() is not a cancellation point,
-    // therefore the main thread can't join the workers
-    Sem_wait(&full);
-    Sem_wait(&mutex);
+//-----------------------------------------------------------------------------
 
-    // get work
-    Work *current_work = &works[use_ptr];
-    use_ptr = (use_ptr + 1) % chunks;
+void *Job(void *arg) {
+    Work *workChunk_list = (Work*)arg;
 
-    // do work
-    Result *head = NULL;
-    Result *previous_result = NULL;
-    char previous_character = '\0';
-    int previous_count = 0;
-    for (long long i = 0; i < current_work->chunk_size; i++) {
-      char character = current_work->addr[i];
-      if (character == previous_character) {
-        previous_count++;
-      } else {
-        if (previous_count != 0) {
-          Result *last_result = create_result(previous_count, previous_character);
-          if (previous_result) {
-            previous_result->next = last_result;
-          }
-          previous_result = last_result;
-          if (!head) {
-            head = previous_result;
-          }
+    while (1) {
+        // wait to be assigned work
+        sem_wait(&worker_loaded);
+        sem_wait(&mutex);
+
+        // get work
+        Work *curr_worker = &workChunk_list[chunkInUse_idx];
+        chunkInUse_idx = (chunkInUse_idx + 1) % chunks;
+
+        // do work
+        WorkList *head = NULL, *prev = NULL;
+        char tracked_char = '\0';
+        int count = 0;
+        for (size_t i = 0; i < curr_worker->chunk_size; i++) {
+            char c = curr_worker->addr[i];
+            if (c == tracked_char) {
+                count++;
+            } else {
+                if (count != 0) {
+                    WorkList *last_work_block = work_list_block(count, tracked_char);
+                    if (prev) {
+                        prev->next = last_work_block;
+                    }
+                    prev = last_work_block;
+                    if (!head) {
+                        head = prev;
+                    }
+                }
+                tracked_char = c;
+                count = 1;
+            }
         }
-        previous_count = 1;
-        previous_character = character;
-      }
-    }
-    if (!head) {    // Only 1 type of Character
-      current_work->results = create_result(previous_count, previous_character);
-    } else {
-      current_work->results = head;
-      previous_result->next = create_result(previous_count, previous_character);
-    }
-
-    Sem_post(&mutex);
-    Sem_post(&empty);
-  }
-}
-
-// Littleendian and Bigendian byte order illustrated
-// https://dflund.se/~pi/endian.html
-static void writeFile(int character_count, char *oldBuff) {
-  // character_count = htonl(character_count); // write as network byte order
-  fwrite(&character_count, 4, 1, stdout);
-  fwrite(oldBuff, 1, 1, stdout);
-}
-
-int main(int argc, char *argv[]) {
-  long page_size = sysconf(_SC_PAGE_SIZE);
-
-  if (argc <= 1) {
-    fprintf(stdout, "pzip: file1 [file2 ...]\n");
-    exit(EXIT_FAILURE);
-  }
-
-  // get_nprocs is GNU extension
-  long np = sysconf(_SC_NPROCESSORS_ONLN);
-  pthread_t *threads = malloc(sizeof(pthread_t) * (unsigned long)np);
-  if (!threads) {
-    error_out("Cannot allocate threads");
-  }
-
-  Files *files = malloc(sizeof(Files) * (unsigned long)(argc - 1));
-  if (!files) {
-    error_out("Cannot allocate files");
-  }
-
-  // count chunks number
-  for (int i = 1; i < argc; i++) {
-    int fd = open(argv[i], O_RDONLY);
-    if (fd == -1) {
-        error_out("Invalid file encountered");
-    }
-
-    struct stat sb;
-    if (fstat(fd, &sb) == -1) {
-        error_out("stat");
-    }
-
-    files[i - 1].fd = fd;
-    files[i - 1].size = sb.st_size;
-
-    chunks += (sb.st_size / page_size + 1);
-  }
-
-  // init semaphores
-  Sem_init(&mutex, 0, 1);
-  // set empty to 1 to prevent main thread cancel workers before they do the work
-  Sem_init(&empty, 0, 1);
-  Sem_init(&full, 0, 0);
-
-  Work *works = malloc(sizeof(Work) * (unsigned long)chunks);
-  if (works == NULL) {
-    error_out("malloc");
-  }
-
-  // create workers
-  for (long i = 0; i < np; i++)
-    Pthread_create(&threads[i], NULL, compress, works);
-
-  // create jobs
-  for (int i = 0; i < argc - 1; i++) {
-    long long offset = 0;
-    while (offset < files[i].size) {
-      Sem_wait(&empty);
-      Sem_wait(&mutex);
-
-      works[fill_ptr].chunk_size = page_size;
-      if (offset + page_size > files[i].size)
-        works[fill_ptr].chunk_size = files[i].size - offset;
-
-      char *addr = mmap(NULL, (size_t)works[fill_ptr].chunk_size, PROT_READ,
-                        MAP_PRIVATE, files[i].fd, offset);
-      if (addr == MAP_FAILED)
-        error_out("mmap");
-
-      works[fill_ptr].addr = addr;
-      works[fill_ptr].results = NULL;
-      offset += page_size;
-      fill_ptr = (fill_ptr + 1) % chunks;
-
-      Sem_post(&mutex);
-      Sem_post(&full);
-    }
-    close(files[i].fd);
-  }
-
-  // check jobs are done
-  Sem_wait(&empty);
-  Sem_wait(&mutex);
-
-  // kill and wait workers
-  for (long i = 0; i < np; i++) {
-    Pthread_cancel(threads[i]);
-    Pthread_join(threads[i], NULL);
-  }
-
-  // final compress
-  int last_count = 0;
-  char last_character = '\0';
-  for (long long i = 0; i < chunks; i++) {
-    Result *result;
-    result = works[i].results;
-    while (result != NULL) {
-      if (result == works[i].results &&
-          result->next != NULL) { // first but not last result
-        if (result->character == last_character) {
-          writeFile(result->count + last_count, &result->character);
+        if (!head) {    // Only 1 type of Character
+            curr_worker->work = work_list_block(count, tracked_char);
         } else {
-          if (last_count > 0)
-            writeFile(last_count, &last_character);
-          writeFile(result->count, &result->character);
+            prev->next = work_list_block(count, tracked_char);
+            curr_worker->work = head;
         }
-      } else if (result->next == NULL) {  // last result
-        if (result != works[i].results) { // not first
-          if (i == chunks - 1) {          // last chunk
-            writeFile(result->count, &result->character);
-          } else { // not last chunk
-            last_character = result->character;
-            last_count = result->count;
-          }
-        } else {                                     // first result
-          if (result->character == last_character) { // same
-            if (i != chunks - 1) {                   // not last chunk
-              last_count += result->count;
-            } else {
-              writeFile(result->count + last_count, &result->character);
-            }
-          } else { // not same
-            if (last_count > 0)
-              writeFile(last_count, &last_character);
-            if (i != chunks - 1) {
-              last_character = result->character;
-              last_count = result->count;
-            } else {
-              writeFile(result->count, &result->character);
-            }
-          }
-        }
-      } else {
-        writeFile(result->count, &result->character);
-      }
 
-      Result *tmp = result;
-      result = result->next;
-      free(tmp);
+        // inform contractor about completion
+        sem_post(&mutex);
+        sem_post(&worker_waiting);
     }
-    if (munmap(works[i].addr, (size_t)works[i].chunk_size) != 0)
-      error_out("munmap");
-  }
-  Sem_post(&mutex);
 
-  free(threads);
-  free(files);
-  free(works);
-  Sem_destroy(&mutex);
-  Sem_destroy(&full);
-  Sem_destroy(&empty);
+    return NULL;
+}
 
-  return 0;
+//-----------------------------------------------------------------------------
+
+int main(int argc, char **argv) {
+    if (argc <= 1) {
+        fprintf(stdout, "pzip: file1 [file2 ...]\n");
+        exit(EXIT_FAILURE);
+    }
+
+    mFile_t *files = malloc(sizeof(mFile_t) * (argc - 1));
+    if (!files) {
+        fprintf(stderr, "ERROR: Not enough space for tracking input files\n");
+        exit(EXIT_FAILURE);
+    }
+
+    size_t page_size = sysconf(_SC_PAGE_SIZE);
+    for (int i = 1; i < argc; i++) {
+        int fd = open(argv[i], O_RDONLY);
+        if (fd == -1) {
+            fprintf(stderr, "ERROR: Invalid file (%s) encountered\n", argv[i]);
+            exit(EXIT_FAILURE);
+        }
+
+        struct stat sb;
+        if (fstat(fd, &sb) == -1) {
+            fprintf(stderr, "ERROR: fstat failure on file %s\n", argv[i]);
+            exit(EXIT_FAILURE);
+        }
+
+        files[i-1].fd = fd;
+        files[i-1].size = sb.st_size;
+
+        chunks += (sb.st_size / page_size) + 1;
+    }
+
+    // get_nprocs is GNU extension
+    int num_threads = get_nprocs();
+    pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
+    if (!threads) {
+        fprintf(stderr, "ERROR: Not enough space for storing thread info\n");
+        exit(EXIT_FAILURE);
+    }
+
+    sem_init(&mutex, 0, 1);
+    sem_init(&worker_waiting, 0, 1);   // Prevents the main thread stopping other threads prematurely
+    sem_init(&worker_loaded, 0, 0);
+
+    Work *workChunk_list = malloc(sizeof(Work) * chunks);
+    if (workChunk_list == NULL) {
+        fprintf(stderr, "ERROR: Not enough space for tracking work\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // create workers
+    for (int i = 0; i < num_threads; i++) {
+        pthread_create(&threads[i], NULL, Job, workChunk_list);
+    }
+
+    // create jobs
+    for (int i = 0; i < argc - 1; i++) {
+        size_t offset = 0;
+        while (offset < (size_t)files[i].size) {
+            sem_wait(&worker_waiting);
+            sem_wait(&mutex);
+
+            workChunk_list[chunkFilled_idx].chunk_size = page_size;
+            if ((page_size + offset) > (size_t)files[i].size) {
+                workChunk_list[chunkFilled_idx].chunk_size = files[i].size - offset;
+            }
+
+            char *addr = mmap(NULL, workChunk_list[chunkFilled_idx].chunk_size, PROT_READ, MAP_PRIVATE, files[i].fd, offset);
+            if (addr == MAP_FAILED) {
+                fprintf(stderr, "ERROR: Cannot mmap chunks %ld bytes in from file: %s\n", offset, argv[i]);
+                exit(EXIT_FAILURE);
+            }
+
+            workChunk_list[chunkFilled_idx].addr = addr;
+            workChunk_list[chunkFilled_idx].work = NULL;
+
+            offset += page_size;
+            chunkFilled_idx = (chunkFilled_idx + 1) % chunks;
+
+            sem_post(&mutex);
+            sem_post(&worker_loaded);
+        }
+        close(files[i].fd);
+    }
+
+    sem_wait(&worker_waiting);
+    sem_wait(&mutex);
+
+    // kill workers
+    for (int i = 0; i < num_threads; i++) {
+        pthread_cancel(threads[i]);
+        pthread_join(threads[i], NULL);
+    }
+    free(threads);
+    free(files);
+
+    // output all the work
+    int last_count = 0;
+    char last_character = '\0';
+    for (size_t i = 0; i < chunks; i++) {
+        WorkList *work_block = workChunk_list[i].work, *tmp;
+        while (work_block) {
+            if (work_block == workChunk_list[i].work && work_block->next) {
+                if (work_block->character == last_character) {
+                    write_out(work_block->count + last_count, &work_block->character);
+                } else {
+                    if (last_count > 0) {
+                        write_out(last_count, &last_character);
+                    }
+                    write_out(work_block->count, &work_block->character);
+                }
+            } else if (!work_block->next) {
+                if (work_block != workChunk_list[i].work) {
+                    if (i == chunks - 1) {
+                        write_out(work_block->count, &work_block->character);
+                    } else {
+                        last_character = work_block->character;
+                        last_count = work_block->count;
+                    }
+                } else {
+                    if (work_block->character == last_character) {
+                        if (i != chunks - 1) {
+                            last_count += work_block->count;
+                        } else {
+                            write_out(work_block->count + last_count, &work_block->character);
+                        }
+                    } else { // not same
+                        if (last_count > 0) {
+                            write_out(last_count, &last_character);
+                        }
+                        if (i != chunks - 1) {
+                            last_character = work_block->character;
+                            last_count = work_block->count;
+                        } else {
+                            write_out(work_block->count, &work_block->character);
+                        }
+                    }
+                }
+            } else {
+                write_out(work_block->count, &work_block->character);
+            }
+
+            tmp = work_block;
+            work_block = work_block->next;
+            free(tmp);
+        }
+        if (munmap(workChunk_list[i].addr, (size_t)workChunk_list[i].chunk_size) != 0) {
+            fprintf(stderr, "ERROR: munmap issues\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    free(workChunk_list);
+
+    sem_destroy(&mutex);
+    sem_destroy(&worker_loaded);
+    sem_destroy(&worker_waiting);
+
+    return 0;
 }
